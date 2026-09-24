@@ -1,0 +1,90 @@
+"""Config file for Sphinx documentation"""
+
+import shutil
+from importlib.metadata import version as pkg_version
+from pathlib import Path
+
+PROJECT_DIR = Path(__file__).parent.parent.absolute()
+PACKAGE_DIR = str(PROJECT_DIR / "pyrate_limiter")
+MODULE_DOCS_DIR = "modules"
+
+# General information about the project.
+exclude_patterns = ["_build"]
+master_doc = "index"
+needs_sphinx = "4.0"
+source_suffix = [".rst", ".md"]
+templates_path = ["_templates"]
+project = "pyrate-limiter"
+version = release = version = pkg_version("pyrate-limiter")
+
+# Sphinx extensions
+extensions = [
+    "sphinx.ext.autodoc",
+    "sphinx.ext.autosummary",
+    "sphinx.ext.intersphinx",
+    "sphinx.ext.napoleon",
+    "sphinx_autodoc_typehints",
+    "sphinx_copybutton",
+    "sphinxcontrib.apidoc",
+    "sphinxcontrib.mermaid",
+    "myst_parser",
+]
+
+suppress_warnings = ["ref.ref", "duplicate.object", "ref.python"]
+
+myst_enable_extensions = ["html_image"]
+myst_heading_anchors = 6
+# Render ```mermaid fenced blocks (from the included README) as diagrams
+# instead of failing under -W with an unknown-lexer warning.
+myst_fence_as_directive = ["mermaid"]
+
+# Enable automatic links to other projects' Sphinx docs
+intersphinx_mapping = {
+    "python": ("https://docs.python.org/3", None),
+}
+
+# napoleon settings
+napoleon_google_docstring = True
+napoleon_include_init_with_doc = True
+numpydoc_show_class_members = False
+
+# copybutton settings: Strip prompt text when copying code blocks
+copybutton_prompt_text = r">>> |\.\.\. |\$ "
+copybutton_prompt_is_regexp = True
+
+# Disable autodoc's built-in type hints, and use sphinx_autodoc_typehints extension instead
+autodoc_typehints = "none"
+
+# Mock optional dependency so autodoc can resolve its type annotations
+autodoc_mock_imports = ["psycopg"]
+
+# Auto-generage module docs with sphinx-apidoc
+apidoc_module_dir = PACKAGE_DIR
+apidoc_output_dir = MODULE_DOCS_DIR
+apidoc_module_first = True
+apidoc_separate_modules = True
+apidoc_toc_file = "index"
+
+# HTML general settings
+html_show_sphinx = False
+pygments_style = "friendly"
+pygments_dark_style = "material"
+
+# HTML theme settings
+html_logo = "_static/logo.png"
+html_static_path = ["_static"]
+html_theme = "furo"
+html_theme_options = {
+    "sidebar_hide_name": True,
+}
+
+
+def setup(app: object) -> None:
+    """Overwrite apidoc-generated rst for __init__ with a static version that adds :no-index:"""
+
+    def copy_static_package_rst(app: object) -> None:
+        src = PROJECT_DIR / "docs" / "pyrate_limiter.rst.in"
+        dst = PROJECT_DIR / "docs" / MODULE_DOCS_DIR / "pyrate_limiter.rst"
+        shutil.copy(src, dst)
+
+    app.connect("builder-inited", copy_static_package_rst)  # type: ignore [attr-defined]

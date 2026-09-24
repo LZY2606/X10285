@@ -1,0 +1,26 @@
+services:
+  redis-master:
+    image: redis:7
+    command: ["redis-server","--appendonly","yes","--requirepass","changeme"]
+    ports: ["6379:6379"]
+    networks: [pyrate-bay]
+
+  redis-slave:
+    image: redis:7
+    command: ["redis-server","--replicaof","redis-master","6379","--masterauth","changeme","--requirepass","changeme"]
+    ports: ["6380:6379"]
+    networks: [pyrate-bay]
+
+  postgres:
+    image: postgres:18
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_PASSWORD=postgres
+    command: ["postgres","-c","max_connections=1000"]
+    networks:
+      - pyrate-bay
+
+networks:
+  pyrate-bay:
+    driver: bridge

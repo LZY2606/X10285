@@ -1,0 +1,477 @@
+# Change Log
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](http://keepachangelog.com/)
+and this project adheres to [Semantic Versioning](http://semver.org/).
+
+## [4.5.0]
+
+Pluggable rate-limiting algorithms. Additive — no breaking public API changes;
+the default behaviour of every existing bucket is unchanged.
+
+### Added
+- **`GCRA` / `TokenBucket` algorithms, and `StateBucket` to run them.** These
+  keep a couple of numbers per key instead of one entry per consumed unit, so
+  storage does not grow with traffic and the wait is exact without any lookup.
+  `TokenBucket` *is* `GCRA` under a familiar name — one implementation, not two.
+
+  ```python
+  from pyrate_limiter import Duration, Limiter, Rate, StateBucket, TokenBucket
+
+  limiter = Limiter(StateBucket([Rate(5, Duration.SECOND, burst=10)], algorithm=TokenBucket()))
+  ```
+
+  Stores: `InMemoryStateStore`, `MultiprocessStateStore`, and `RedisStateStore`
+  (transition runs as a Lua script, so the read-modify-write is atomic across
+  clients; keys carry a TTL and need no `leak()`). For a 1000/minute limit at
+  saturation the Redis state is ~100 bytes against roughly 89 KB of sorted set.
+  GCRA's state is integer microseconds rather than fractional milliseconds:
+  accumulating a fractional emission interval onto an absolute timestamp loses
+  the low bits, which would reject the last unit of a full burst.
+- **`Rate(..., burst=N)`** — how many units may be spent at once. Read only by
+  the constant-state algorithms; defaults to `limit`, which is classic
+  token-bucket behaviour. `burst=1` is a perfectly smooth drip.
+- **`WallClock`** — epoch-millisecond clock, for state compared across machines
+  where a monotonic clock is meaningless. `RedisStateStore` defaults to it.
+- `limiter_factory.create_token_bucket_limiter()`.
+- **`FixedWindow` algorithm.** Counts within a wall-clock-aligned window that
+  resets every `interval`, rather than a rolling one. Pass it to any built-in
+  bucket: `InMemoryBucket(rates, algorithm=FixedWindow())`. Cheaper and coarser
+  than the default — up to `2 * limit` can pass across a boundary — and the
+  right choice for mirroring an upstream API that genuinely resets on the hour.
+  Works on all five backends.
+- Every built-in bucket now takes an `algorithm=` argument, defaulting to
+  `SlidingWindowLog()`. Existing code is unaffected.
+- `Decision` now carries `retry_after_ms` alongside the verdict, and `put()`
+  records it. `AbstractBucket.waiting()` reads that recording instead of
+  deriving the wait from storage a second time. Custom buckets that record
+  nothing keep working: `waiting()` falls back to the previous `peek()`-based
+  derivation.
+- `AbstractBucket.put_decision()` returns the full `Decision` for a put, so the
+  verdict and the retry-after arrive together rather than via the
+  `failing_rate` attribute plus a follow-up `waiting()` call.
+- `Algorithm`, `LogAlgorithm`, `Decision` and `SlidingWindowLog` are exported
+  from the package root.
+
+### Fixed
+- **Packaging**: the optional backends are now real, pip-installable extras.
+  `pip install "pyrate-limiter[all]"` — the command the README has always
+  documented — previously resolved to nothing: the project declared only PEP 735
+  `[dependency-groups]`, which pip cannot reach through extras syntax, so the
+  install emitted `WARNING: does not provide the extra 'all'` and then failed at
+  `import redis`. `redis`, `postgres`, `filelock` and `all` now all work.
+- **SQLiteBucket**: a successful `put()` now clears `failing_rate`. Every other
+  backend already did; SQLite left the last denial standing indefinitely.
+
+### Performance
+- **RedisBucket**: the Lua script returns the blocking item's timestamp with the
+  verdict, so a rate-limited request no longer needs a second `ZRANGE` round
+  trip to learn how long to wait — and the wait can no longer be computed
+  against a sorted set that moved in between.
+- **PostgresBucket**: the retry-after is resolved inside the same `EXCLUSIVE`
+  table lock as the check, removing both a round trip and that same race.
+- **SQLiteBucket**: likewise resolved inside `put()`'s existing lock hold, so
+  the background `Leaker` cannot delete rows between the verdict and the wait.
+- **InMemoryBucket** / **MultiprocessBucket**: the wait falls out of the bisect
+  `put()` already performs — no second scan, and no allocation on the admit path.
+
+### Documentation
+- The README and package description no longer describe the library as
+  implementing "the Leaky-Bucket algorithm". The default has always been a
+  sliding-window log; the leaky-bucket meter is now genuinely available as
+  `GCRA`, so the term is reserved for it.
+
+### Internal / Refactor
+- `StateAlgorithm` declares `redis_args(rates)` so a policy's Lua script and its
+  arguments stay a matched pair it owns. `RedisStateStore` passes them through
+  without inspecting them, rather than assuming GCRA's shape.
+- `Algorithm.max_weight(rate)` is the one place asking whether a weight can ever
+  be admitted — `rate.limit` for the window algorithms, `rate.burst` for GCRA.
+- `Algorithm` now has two sub-interfaces: `LogAlgorithm` (an entry per consumed
+  unit) and `StateAlgorithm` (a fixed tuple of numbers). `StateAlgorithm.step()`
+  must evaluate every rate before committing any of them, so a rate failing late
+  never leaves an earlier one debited.
+- Split `LogAlgorithm` out of `Algorithm` for policies whose state is a log of
+  timestamped items. `leak_bound()` and the new `blocking_offset()` /
+  `retry_after()` hooks live there; constant-state policies (token bucket, GCRA)
+  will not implement it.
+- The inclusive-window `+1` boundary correction now lives in exactly one place
+  (`SlidingWindowLog.retry_after`) instead of being inlined in `waiting()`.
+
+## [4.4.0]
+
+Bug-fix, scalability, and internal-refactor release. No public API changes
+(the new `AbstractBucket.is_async` attribute is additive).
+
+### Fixed
+- **InMemoryBucket**: guard the internal item list with a lock so the
+  background `Leaker` thread can no longer race `put`/`peek`/`leak`. This was a
+  data race in the default configuration (in-memory bucket + scheduled leak).
+  `MultiprocessBucket` aliases this lock to its shared cross-process lock. (#302)
+- **PostgresClock**: when the DB time query fails, fall back to local
+  **wall-clock** epoch time instead of monotonic time. The monotonic fallback
+  was ~5 orders of magnitude smaller than the stored epoch-ms timestamps and
+  would corrupt every window comparison and leak bound. (#302)
+- **Leaker**: make the background sync-leak worker restartable. Re-registering a
+  bucket after every bucket had been disposed previously raised
+  `RuntimeError: threads can only be started once`. (#302)
+- Keep `Limiter` picklable after the `InMemoryBucket` lock addition. (#302)
+
+### Performance & Scalability
+- **Limiter**: release the limiter lock during the synchronous blocking wait, so
+  a long wait on one key no longer serializes acquisitions for every other key
+  sharing the limiter. (#304)
+- **RedisBucket**: batch weighted `ZADD`s in bounded chunks inside the atomic
+  Lua script, lowering latency for high-weight puts. (#284)
+
+### Internal / Refactor
+- Unify the limiter's sync/async acquire plumbing into a single coroutine and
+  share the delay-step decision across the sync and async branches. (#303)
+- Add a declarative `is_async` bucket attribute so the `Leaker` no longer detects
+  async by executing a side-effecting `leak(0)` probe. `RedisBucket` still probes
+  because it may wrap either a sync or an async client. (#305)
+- Introduce an internal `Algorithm`/`Decision` seam (`SlidingWindowLog`) that the
+  built-in buckets delegate their per-rate admit decision and leak bound to —
+  the foundation for pluggable algorithms (e.g. GCRA, sliding-window-counter) in
+  a future release. (#307)
+
+### Documentation
+- Document that `RedisBucket` keeps one sorted-set member per consumed unit, and
+  that long-window / high-volume quotas may want a coarser counter-based backend
+  for bounded memory. (#284)
+
+### CI
+- The release workflow now also creates a GitHub Release for the pushed tag and
+  attaches the built `dist/*` artifacts, in addition to publishing to PyPI.
+
+## [4.3.1]
+
+Performance and maintenance release. No API or behavior changes.
+
+### Performance
+- **PostgresBucket**: insert all `weight` unit-rows in a single statement
+  (`SELECT … FROM generate_series`) instead of one INSERT per unit — ~3.4×
+  faster weighted puts and a shorter `EXCLUSIVE` lock hold. (#296)
+- **PostgresBucket**: compute every rate's windowed count in one query
+  (`COUNT(*) FILTER`) instead of one round trip per rate — ~2× faster
+  multi-rate checks, fewer round trips under the lock. (#297)
+- **`SingleBucketFactory.wrap_item`**: inline the sync fast path (no
+  per-acquire closures) — ~23% faster item wrapping on the hot path. (#296)
+- Deduplicate the sync/async deadline math in `_delay_waiter` into a single
+  shared helper. (#294)
+
+### Documentation
+- Rewrite the README for accuracy, structure, and presentation, and replace the
+  outdated architecture image with a component-level Mermaid diagram that
+  renders on both GitHub and ReadTheDocs. (#293, #295)
+
+### CI
+- Move GitHub Actions off the deprecated Node-20 runtime to Node-24
+  (`checkout@v5`, `setup-python@v6`, `setup-uv@v7`, `upload-artifact@v6`,
+  `download-artifact@v7`). (#295)
+
+## [4.3.0]
+
+Bug-fix and hardening release. It contains a few breaking changes that affect
+only edge or undocumented usage — see **Breaking Changes** below.
+
+### Breaking Changes
+- Ill-formed rate lists now raise `ValueError` at bucket construction instead
+  of being silently mis-enforced. A valid list is ordered by strictly
+  increasing interval, with strictly increasing limits and non-increasing
+  density (the "generous-before-tight" contract). (#239)
+- `binary_search` has been removed from the public API. It was an undocumented
+  internal helper, now replaced internally by the standard library `bisect`. (#290)
+- `PgQueries` SQL templates now use bound `%s` parameters instead of the
+  `{offset}` / `{timestamp}` format placeholders. (#233)
+
+### Security
+- SQLite and Postgres backends no longer build SQL through string
+  interpolation. The user-supplied item name (SQLite) and the table name
+  (Postgres) are now bound/quoted, closing a SQL-injection vector and fixing
+  crashes on names containing quotes or other metacharacters. (#233, #244)
+
+### Fixed
+- Blocking `try_acquire` no longer busy-spins (burning CPU until the next
+  background leak) or spuriously times out when `buffer_ms=0`; `waiting()` now
+  clears the inclusive window lower bound correctly. (#289)
+- `try_acquire_async(timeout=0)` now succeeds when capacity is available
+  instead of always returning `False`. (#289)
+- SQLite `leak()` no longer raises `AttributeError` when invoked on a closed
+  connection during teardown (fixes the unstable `test_sqlite_filelock_bucket`). (#244)
+- Rate lists are now consistently sorted by interval across all backends,
+  fixing a latent `leak()` bug when unsorted rates were passed to the Redis,
+  SQLite, or Postgres buckets. (#239)
+
+### Changed
+- Replaced the custom `binary_search` with the standard library `bisect`. (#290)
+
+### Documentation
+- Fixed stale v4 examples in the README (removed the long-gone `clock=`,
+  `raise_when_fail`, and `max_delay` parameters) and documented how to use a
+  custom / distributed clock in v4. (#261)
+
+## [4.0.0]
+
+Fourth major release with significant API simplification and breaking changes.
+
+### Breaking Changes
+
+#### Exceptions Removed
+- `BucketFullException` and `LimiterDelayException` have been removed
+- Rate limiting now uses blocking behavior instead of exception-based flow control
+
+#### Limiter Constructor Simplified
+- Removed `clock` parameter - each bucket now manages its own clock via `bucket.now()`
+- Removed `raise_when_fail` parameter - no exceptions are raised
+- Removed `max_delay` parameter - blocking is now controlled per-call
+- Removed `retry_until_max_delay` parameter
+- Added `buffer_ms` parameter (default 50ms) for clock drift tolerance
+
+#### Clock Changes
+- `TimeClock` removed - use `MonotonicClock` instead
+- `SQLiteClock` removed - buckets now manage their own time
+- `TimeAsyncClock` renamed to `MonotonicAsyncClock`
+- Clock is no longer passed to Limiter; buckets have built-in `now()` method
+
+#### try_acquire API Changes
+- New signature: `try_acquire(name="pyrate", weight=1, blocking=True, timeout=-1)`
+- `blocking=True` (default): blocks until permit is acquired
+- `blocking=False`: returns `False` immediately if bucket is full
+- Added `try_acquire_async()` for proper async acquisition with asyncio.Lock
+
+#### Decorator API Changes
+- Old: `limiter.as_decorator()(mapping_func)(target_func)` where mapping returns `(name, weight)`
+- New: `limiter.as_decorator(name="...", weight=...)(target_func)` with direct parameters
+
+#### BucketFactory Changes
+- `schedule_leak(bucket, clock)` now `schedule_leak(bucket)` - no clock parameter
+- `create(clock, bucket_class, ...)` now `create(bucket_class, ...)` - no clock parameter
+
+### New Features
+- Context manager support: `with Limiter(...) as limiter:` and `with bucket:`
+- `limiter.close()` method for resource cleanup
+- `limiter_factory` module with convenience functions:
+  - `create_sqlite_limiter()`
+  - `create_inmemory_limiter()`
+  - `init_global_limiter()`
+- `MultiprocessBucket` for multiprocessing environments
+- Web request helpers in `pyrate_limiter.extras`:
+  - `aiohttp_limiter.RateLimitedSession`
+  - `httpx_limiter.RateLimiterTransport` / `AsyncRateLimiterTransport`
+  - `requests_limiter.RateLimitedRequestsSession`
+- Time is now monotonic by default (`monotonic_ns()`)
+- `buffer_ms` configurable per-Limiter (default 50ms)
+
+### Improvements
+- Migrated from Poetry to UV for builds
+- Switched from Bitnami to official Redis/Postgres Docker images
+- Pre-commit switched to Ruff
+- Improved multiprocessing support with proper locking
+- Better asyncio support with thread-local async locks
+
+## [3.9.0]
+* Introduce MultiprocessBucket
+* Update documentation to include MultiprocessBucket
+* Add delay configure
+* Simplify lock interface for SQLFileLock & MultiprocessBucket
+
+## [3.8.1]
+* Keep Retrying until Max Delay Has Expired
+* Postgres performance turning
+* Fix cursor leaks on SQLiteBucket
+
+## [3.8.0]
+* Add FileLock option for SQLiteBucket
+
+## [3.7.1]
+* Update package metadata and local dev config to support python 3.13
+
+## [3.7.0]
+* Add method to remove bucket
+
+## [3.6.2]
+* Fix table creation for SQLiteBucket
+
+## [3.6.1]
+* Support creating/getting bucket asynchronously
+
+## [3.6.0]
+* Use psycopg3 for PostgresBucket
+
+## [3.5.1]
+* Fix dependencies for "all" package extra
+
+## [3.5.0]
+* Add PostgresBucket backend
+
+## [3.4.1]
+* Fix: unnecessary warning during async check
+
+## [3.4.0]
+* Improved in-memory-bucket performance
+
+## [3.3.0]
+* Fix background task for leaking
+
+## [3.2.1] - 2024-02-13
+* Fix Redis CROSSSLOT Keys following issue [#126](https://github.com/vutran1710/PyrateLimiter/issues/126)
+
+## [3.1.1] - 2024-01-02
+* Fix broken SqliteBucket following issue [#132](https://github.com/vutran1710/PyrateLimiter/issues/132)
+
+## [3.1.0] - 2023-08-28
+* Allow to pass rates directly to Limiter to use default ImMemoryBucket with Limiter
+* Allow to pass *Duration* to `max_delay` argument of Limiter
+
+## [3.0.2] - 2023-08-28
+* Critical bug fix: importing redis fail crashing apps
+
+## [3.0.0] - 2023-08-28
+ Third major release with API breaking changes:
+- Drop python 3.7 (only python ^3.8)
+- Bucket must be initialized before passing to Limiter
+- Auto leaking (provided by BucketFactory)
+- Decorator API changes
+- Limiter workable with both async/sync out-of-the-box
+- Async RedisBucket built-in
+- Contextmanager not available yet
+
+## [2.10.0] - 2023-02-26
+### Updates
+* Add change log to sdist
+* Improve test coverage
+* Force check some bucket-keyword arguments
+
+## [2.9.1] - 2023-02-26
+### Fixed
+* Fix unit test to make test results stable
+* Fix remaining-time calculation using exact 3 decimals only
+* Increase test intesity to ensure correctness
+
+## [2.8.5] - TBD
+### Fixed
+* Fix SQLite OperationalError when getting more items than SQLite variable limit
+
+## [2.8.4] - 2022-11-23
+### Fixed
+* Build both `wheel` and `sdist` on publish
+
+## [2.8.3] - 2022-10-17
+### Added
+* Add option to expire redis key when using RedisBucket
+
+## [2.8.2] - 2022-09-24
+### Removed
+* Python 3.6 support
+
+## [2.8.1] - 2022-04-11
+### Added
+* Add Sphinx config
+* Add documentation site: https://pyrate-limiter.readthedocs.io
+* Add some missing type hints
+* Add package metadata to indicate PEP-561 compliance
+
+## [2.8.0] - 2022-04-10
+### Added
+* Add `flush()` method to all bucket classes
+
+## [2.7.0] - 2022-04-06
+### Added
+* Add `FileLockSQliteBucket` for a SQLite backend with file-based locking
+* Add optional backend dependencies to package metadata
+
+## [2.6.3] - 2022-04-05
+### Fixed
+* Make SQLite bucket thread-safe and multiprocess-safe
+
+## [2.6.2] - 2022-03-30
+### Fixed
+* Remove development scripts from package published on PyPI
+
+### Added
+* Add `nox` to run development scripts
+
+## [2.6.1] - 2022-03-30
+### Updated
+* Replace all formatting/linting tools with *pre-commit*
+
+## [2.6.0] - 2021-12-08
+### Added
+* Add `SQliteBucket` to persist rate limit data in a SQLite database
+
+## [2.5.0] - 2021-12-08
+### Added
+* Custom time source
+
+## [2.4.6] - 2021-09-30
+* Add `RedisClusterBucket` to support using `PyrateLimiter` with `redis-py-cluster`
+* Update README, add Table of Content
+
+## [2.3.6] - 2021-09-23
+* Run CI tests for all supported python versions
+* Fix issue with deployments on Travis CI
+
+## [2.3.5] - 2021-09-22
+### Added
+* Use `time.monotonic()` instead of `time.time()`
+* Support for floating point rate-limiting delays (more granular than 1 second)
+
+## [2.3.4] - 2021-06-01
+### Fixed
+* Bucket group initialization
+
+## [2.3.3] - 2021-05-08
+### Added
+* Support for python 3.6
+
+## [2.3.2] - 2021-05-06
+### Fixed
+* Incorrect type hint
+
+## [2.3.1] - 2021-04-26
+### Added
+* LICENSE file to be included in PyPI package
+
+### Fixed
+* Incorrect delay time when using using `Limiter.ratelimit()` with `delay=True`
+
+## [2.3.0] - 2021-03-01
+### Added
+* Support for using `Limiter.ratelimit()` as a contextmanager or async contextmanager
+* Separate `LimitContextDecorator` class to handle `Limiter.ratelimit()` behavior
+* Package published on conda-forge
+
+## [2.2.2] - 2021-03-03
+### Changed
+* Internal: Reduce cognitive complexity
+
+## [2.2.1] - 2021-03-02
+### Fixed
+* Incorrect check log against time-window
+
+## [2.2.0] - 2021-02-26
+### Added
+* `Limiter.ratelimit()` method, an async-compatible decorator that optionally adds rate-limiting delays
+
+## [2.1.0] - 2021-02-21
+
+## [2.0.3] - 2020-06-01
+
+## [2.0.2] - 2020-06-01
+
+## [2.0.1] - 2020-06-01
+
+## [2.0.0] - 2019-12-29
+
+## [1.1.0] - 2019-12-17
+### Removed
+- Code duplication
+
+### Added
+- Thread lock for Bucket's state modification in case of Multi-threading
+- Html Cover Report
+
+### Fixed
+- LocalBucket's default init value being mutated
+- Typos. A lot of friggin' typos.

@@ -1,0 +1,184 @@
+[project]
+name = "pyrate-limiter"
+dynamic = ["version"]
+description = "Python rate limiter with pluggable algorithms and backends"
+authors = [{ name = "vutr", email = "me@vutr.io" }]
+requires-python = ">=3.10"
+readme = "README.md"
+license = "MIT"
+keywords = [
+    "rate",
+    "rate-limiter",
+    "rate_limiter",
+    "ratelimiter",
+    "leaky-bucket",
+    "ratelimit",
+    "ratelimiting",
+    "httpx",
+    "httpx2",
+    "aiohttp",
+    "limiter",
+    "rate",
+    "requests",
+    "throttle"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Documentation",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+
+[project.urls]
+Homepage = "https://github.com/vutran1710/PyrateLimiter"
+Repository = "https://github.com/vutran1710/PyrateLimiter"
+Documentation = "https://pyratelimiter.readthedocs.io"
+
+[project.optional-dependencies]
+# Installable with pip: `pip install "pyrate-limiter[redis]"`.
+# The [dependency-groups] below are PEP 735 and are for development only -
+# pip cannot reach them through extras syntax, which is why the install
+# command in the README used to resolve to nothing.
+redis = ["redis>=6.2.0"]
+postgres = ["psycopg[pool]>=3.2.9"]
+filelock = ["filelock>=3.0"]
+# Every optional backend, which is what the README documents `all` as.
+all = [
+    "filelock>=3.0",
+    "redis>=6.2.0",
+    "psycopg[pool]>=3.2.9",
+]
+
+[dependency-groups]
+all = [
+    "filelock>=3.0",
+    "redis>=6.2.0",
+    "psycopg[pool]>=3.2.9",
+]
+docs = [
+    "furo",
+    "myst-parser",
+    "sphinx",
+    "sphinx-autodoc-typehints",
+    "sphinx-copybutton",
+    "sphinxcontrib-apidoc",
+    "sphinxcontrib-mermaid",
+]
+dev = [
+    "coverage>=7.10.1",
+    "flake8_polyfill>=1.0.2,<2",
+    "nox~=2025.5",
+    "nox-poetry>=1.0",
+    "pre-commit-uv",
+    "psycopg[pool]>=3.2.9",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.1.0",
+    "pytest-cov>=6.2.1",
+    "pytest-xdist>=3.8.0",
+    "schedule>=1.1.0,<2",
+    "pytest-retry>=1.7.0",
+    "pytest-randomly>=3.16.0",
+    "httpx",
+    "httpx2",
+    "aiohttp",
+    "requests",
+    "psycopg[binary]>=3.2.10; sys_platform == 'win32' or sys_platform == 'darwin'"
+]
+
+
+[tool.black]
+line-length = 120
+
+[tool.coverage.run]
+branch = true
+source = ['pyrate_limiter']
+
+[tool.coverage.report]
+exclude_lines = [
+    "except ImportError:", # Used for missing optional dependencies
+]
+
+[tool.coverage.xml]
+output = 'test-reports/coverage.xml'
+
+[tool.ipdb]
+context = 7
+
+[build-system]
+requires = ["hatchling", "uv-dynamic-versioning"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "pyrate_limiter",
+    "docs",
+    "tests",
+    "examples",
+    "benchmarks",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "pyproject.toml",
+    "setup.cfg",
+    "noxfile.py",
+]
+
+[tool.hatch.build.targets.wheel]
+include = ["pyrate_limiter"]
+
+[tool.hatch.build.targets.wheel.sources]
+"./pyrate_limiter" = "pyrate_limiter"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+retries = 2
+retry_delay = 1
+cumulative_timing = false
+retry_outcome = "rerun"
+markers = [
+    "inmemory: tests using InMemoryBucket",
+    "redis: tests using RedisBucket",
+    "asyncredis: tests using AsyncRedisBucket",
+    "sqlite: tests using SQLiteBucket",
+    "filelocksqlite: tests using SQLite + file lock",
+    "postgres: tests using PostgresBucket",
+    "mpbucket: tests using MultiprocessBucket",
+    "monotonic: tests using MonotonicClock",
+    "timeclock: tests using TimeClock",
+    "asyncclock: tests using TimeAsyncClock",
+]
+
+[tool.ruff]
+line-length = 150
+exclude = [
+  ".git",
+  "__pycache__",
+  "build",
+  "dist",
+  "docs/source/conf.py",
+  "tests",
+]
+extend-include = ["*.ipynb"]
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "S", "B", "G", "N", "I001", "T", "PD", "C90"]
+ignore = [
+  "E501",
+  "C901",
+  "S101"
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
