@@ -21,6 +21,35 @@ DecoratorWrapper = Callable[[Callable[[Any], Any]], Callable[[Any], Any]]
 _UNSET: Any = object()
 
 
+class _TimeBackend(Protocol):
+    """Test-only seam for the two primitives the blocking acquire loop leans
+    on: reading "now" and sleeping while the limiter lock is released.
+
+    Production code always passes ``_REAL_TIME`` (the real ``time`` module
+    functions); the deterministic contract tests inject a virtual clock so the
+    exact same sync *and* async acquire algorithm runs without wall-clock
+    sleeps. Not a supported public surface - it intentionally carries no
+    stability promise.
+    """
+
+    def monotonic(self) -> float: ...
+
+    def sleep(self, seconds: float) -> None: ...
+
+
+class _RealTime:
+    """Default ``_TimeBackend``: delegate to the real clock."""
+
+    def monotonic(self) -> float:
+        return monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        sleep(seconds)
+
+
+_REAL_TIME: _TimeBackend = _RealTime()
+
+
 class LockLike(Protocol):
     def acquire(self, blocking: bool = ..., timeout: Union[float, int, None] = ...) -> bool: ...
     def release(self) -> None: ...
@@ -72,7 +101,13 @@ class SingleBucketFactory(BucketFactory):
 
 
 @contextmanager
-def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeout: int | float = -1):
+def combined_lock(
+    locks: Union[Iterable[LockLike], RLock],
+    blocking: bool,
+    timeout: int | float = -1,
+    *,
+    now: Callable[[], float] = monotonic,
+):
     if not isinstance(locks, Iterable):
         acquired_ok = locks.acquire(blocking=blocking, timeout=timeout)
         if not acquired_ok:
@@ -84,7 +119,7 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
 
     else:
         acquired_locks = []
-        deadline = monotonic() + timeout if blocking and timeout != -1 else None
+        deadline = now() + timeout if blocking and timeout != -1 else None
         try:
             for lock in locks:
                 if not blocking:
@@ -93,7 +128,7 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
                     ok = lock.acquire()
                 else:
                     assert deadline is not None
-                    remaining = max(0.0, deadline - monotonic())
+                    remaining = max(0.0, deadline - now())
                     ok = lock.acquire(timeout=remaining)
 
                 if not ok:
@@ -105,7 +140,12 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
                 lock.release()
 
 
-def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> Tuple[float, bool]:
+def _plan_delay_step(
+    deadline: Optional[float],
+    delay_ms: Union[int, float],
+    *,
+    now: Callable[[], float] = monotonic,
+) -> Tuple[float, bool]:
     """Plan one delay step for `_delay_waiter`.
 
     Returns ``(seconds_to_sleep, raise_timeout_after_sleep)``. Raises
@@ -116,7 +156,7 @@ def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> 
     """
     if deadline is None:
         return delay_ms / 1000, False
-    remaining_ms = (deadline - monotonic()) * 1000
+    remaining_ms = (deadline - now()) * 1000
     if remaining_ms <= 0:
         raise TimeoutError()
     if remaining_ms < delay_ms:
@@ -140,15 +180,22 @@ class Limiter:
         self,
         argument: Union[BucketFactory, AbstractBucket, Rate, List[Rate]],
         buffer_ms: int = 50,
+        *,
+        _time: Optional[_TimeBackend] = None,
     ):
         """Init Limiter using either a single bucket / multiple-bucket factory
         / single rate / rate list.
 
         Parameters:
             argument (Union[BucketFactory, AbstractBucket, Rate, List[Rate]]): The bucket or rate configuration.
+
+        ``_time`` is a private test seam: a virtual clock lets the deterministic
+        contract tests drive the production acquire algorithm without real
+        sleeps. Defaults to the real clock; not part of the public API.
         """
 
         self.buffer_ms = buffer_ms
+        self._time = _time or _REAL_TIME
         self.bucket_factory = self._init_bucket_factory(argument)
         self.lock = RLock()
         self._thread_local = local()
@@ -221,7 +268,7 @@ class Limiter:
             async def _handle_async(delay):
                 while True:
                     if deadline is not None:
-                        remaining_ms = (deadline - monotonic()) * 1000
+                        remaining_ms = (deadline - self._time.monotonic()) * 1000
                         if remaining_ms <= 0:
                             raise TimeoutError()
 
@@ -232,7 +279,7 @@ class Limiter:
                         return False
                     d = sleep_ms
 
-                    secs, timed_out = _plan_delay_step(deadline, d)
+                    secs, timed_out = _plan_delay_step(deadline, d, now=self._time.monotonic)
                     await asyncio.sleep(secs)
                     if timed_out:
                         raise TimeoutError()
@@ -258,8 +305,8 @@ class Limiter:
                 delay = sleep_ms
                 total_delay += delay
 
-                secs, timed_out = _plan_delay_step(deadline, delay)
-                sleep(secs)
+                secs, timed_out = _plan_delay_step(deadline, delay, now=self._time.monotonic)
+                self._time.sleep(secs)
                 if timed_out:
                     raise TimeoutError()
 
@@ -339,15 +386,15 @@ class Limiter:
             if sleep_ms is None:
                 return False
 
-            secs, timed_out = _plan_delay_step(deadline, sleep_ms)
-            sleep(secs)  # lock intentionally NOT held during the sleep
+            secs, timed_out = _plan_delay_step(deadline, sleep_ms, now=self._time.monotonic)
+            self._time.sleep(secs)  # lock intentionally NOT held during the sleep
             if timed_out:
                 raise TimeoutError()
 
             item.timestamp += sleep_ms
-            remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - monotonic())
+            remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - self._time.monotonic())
 
-            with combined_lock(self.lock, blocking=True, timeout=remaining):
+            with combined_lock(self.lock, blocking=True, timeout=remaining, now=self._time.monotonic):
                 re_acquire = bucket.put(item)
 
                 if isawaitable(re_acquire):
@@ -526,7 +573,7 @@ class Limiter:
                     result = await result
                     continue
 
-                remaining = deadline - monotonic()
+                remaining = deadline - self._time.monotonic()
                 if remaining <= 0:
                     timed_out = True
                     _cancel_if_pending(result)
@@ -577,9 +624,9 @@ class Limiter:
         Return true on success, false on failure
         """
 
-        deadline: Optional[float] = monotonic() + timeout if timeout != -1 else None
+        deadline: Optional[float] = self._time.monotonic() + timeout if timeout != -1 else None
 
-        with combined_lock(self.lock, blocking=blocking, timeout=timeout):
+        with combined_lock(self.lock, blocking=blocking, timeout=timeout, now=self._time.monotonic):
             assert weight >= 0, "item's weight must be >= 0"
 
             if weight == 0:
