@@ -124,6 +124,23 @@ def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> 
     return delay_ms / 1000, False
 
 
+def _blocking_sleep(seconds: float) -> None:
+    """Sleep primitive used by every sync blocking delay loop below.
+
+    Private test seam (virtual-time contract suite): a deterministic harness
+    may substitute this to advance a virtual clock instead of sleeping real
+    time. Only the sleep is substituted - the wait computation, deadline math
+    and re-put around it remain the production logic under test, so no
+    parallel algorithm is maintained for tests.
+    """
+    sleep(seconds)
+
+
+async def _async_blocking_sleep(seconds: float) -> None:
+    """Async twin of ``_blocking_sleep``; same test-seam contract."""
+    await asyncio.sleep(seconds)
+
+
 class Limiter:
     """This class responsibility is to sum up all underlying logic
     and make working with async/sync functions easily
@@ -233,7 +250,7 @@ class Limiter:
                     d = sleep_ms
 
                     secs, timed_out = _plan_delay_step(deadline, d)
-                    await asyncio.sleep(secs)
+                    await _async_blocking_sleep(secs)
                     if timed_out:
                         raise TimeoutError()
 
@@ -259,7 +276,7 @@ class Limiter:
                 total_delay += delay
 
                 secs, timed_out = _plan_delay_step(deadline, delay)
-                sleep(secs)
+                _blocking_sleep(secs)
                 if timed_out:
                     raise TimeoutError()
 
@@ -340,7 +357,7 @@ class Limiter:
                 return False
 
             secs, timed_out = _plan_delay_step(deadline, sleep_ms)
-            sleep(secs)  # lock intentionally NOT held during the sleep
+            _blocking_sleep(secs)  # lock intentionally NOT held during the sleep
             if timed_out:
                 raise TimeoutError()
 
