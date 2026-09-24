@@ -8,6 +8,7 @@ from typing import List, Optional
 from ..abstracts.algorithm import ADMITTED, Decision, LogAlgorithm
 from ..abstracts.bucket import AbstractBucket
 from ..abstracts.rate import Rate, RateItem
+from ..clocks import AbstractClock
 
 # Items are kept sorted by timestamp ascending; key for bisect lookups.
 _by_timestamp = attrgetter("timestamp")
@@ -20,17 +21,32 @@ class InMemoryBucket(AbstractBucket):
     Pros: fast, safe, and precise
     Cons: since it resides in local memory, the data is not persistent, nor scalable
     Usecase: small applications, simple logic
+
+    ``clock=`` injects the timestamp source (same ``AbstractBucket._clock``
+    production path ``StateBucket`` uses) - e.g. a deterministic clock for
+    tests or simulations. No behaviour changes when omitted.
     """
 
     items: List[RateItem]
     failing_rate: Optional[Rate]
     is_async = False
 
-    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None):
+    def __init__(
+        self,
+        rates: List[Rate],
+        algorithm: Optional[LogAlgorithm] = None,
+        clock: Optional[AbstractClock] = None,
+    ):
         super().__init__()
 
         if algorithm is not None:
             self._algorithm = algorithm
+
+        if clock is not None:
+            # Same injection point StateBucket uses: the bucket's timestamp
+            # source. Deterministic clocks (tests, simulations) plug in here
+            # instead of monkeypatching the time module.
+            self._clock = clock
 
         self.rates = rates  # AbstractBucket.rates setter sorts + validates
         self.items = []
